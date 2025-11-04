@@ -1,0 +1,224 @@
+# sentiment_drug.py
+import os
+import re
+import joblib
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# NLTK for preprocessing
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize
+
+nltk.download("punkt", quiet=True)
+nltk.download("stopwords", quiet=True)
+nltk.download("wordnet", quiet=True)
+nltk.download("omw-1.4", quiet=True)
+
+# -------------------------
+# Config / file paths
+# -------------------------
+DATA_PATH = Path("drug_reviews.csv")  # change if your CSV file name differs
+RANDOM_STATE = 42
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
+
+# -------------------------
+# Helpers: text cleaning
+# -------------------------
+stop_words = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    # lowercase
+    text = text.lower().strip()
+    # remove URLs, emails
+    text = re.sub(r"http\S+|www\S+|https\S+", " ", text)
+    text = re.sub(r"\S+@\S+", " ", text)
+    # remove non-alphanumeric (keep spaces)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    # collapse multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    # tokenize, remove stopwords, lemmatize
+    tokens = word_tokenize(text)
+    tokens = [lemmatizer.lemmatize(t) for t in tokens if t not in stop_words and len(t) > 1]
+    return " ".join(tokens)
+
+# -------------------------
+# Load dataset
+# -------------------------
+if not DATA_PATH.exists():
+    raise FileNotFoundError(f"Data file not found: {DATA_PATH.resolve()}. Put your CSV here or change DATA_PATH.")
+
+df = pd.read_csv(DATA_PATH)
+
+# show columns for debugging
+print("Columns in CSV:", df.columns.tolist())
+
+# try to locate text column
+text_cols = ["review", "comments", "text", "review_text", "review_body"]
+text_col = next((c for c in text_cols if c in df.columns), None)
+if text_col is None:
+    # fallback to first string column
+    text_col = df.select_dtypes(include=["object"]).columns[0]
+    print(f"No standard text column found; using `{text_col}` as text.")
+
+# create 'sentiment' column if needed
+if "sentiment" not in df.columns:
+    if "rating" in df.columns:
+        # map rating -> sentiment
+        def map_rating(r):
+            try:
+                r = float(r)
+            except:
+                return "neutral"
+            if r >= 4:
+                return "positive"
+            if r == 3:
+                return "neutral"
+            return "negative"
+        df["sentiment"] = df["rating"].apply(map_rating)
+        print("Created `sentiment` from `rating`")
+    else:
+        raise ValueError("CSV must contain either 'sentiment' or 'rating' column (or modify script).")
+
+# drop rows with empty text or missing sentiment
+df[text_col] = df[text_col].fillna("").astype(str)
+df = df[df[text_col].str.strip() != ""]
+df = df[~df["sentiment"].isna()]
+
+# optional: balance classes or show counts
+print("Sentiment distribution:\n", df["sentiment"].value_counts())
+
+# -------------------------
+# Preprocess text
+# -------------------------
+print("Cleaning text... (this can take a moment)")
+df["text_clean"] = df[text_col].apply(clean_text)
+
+# remove empty after cleaning
+df = df[df["text_clean"].str.strip() != ""]
+
+# -------------------------
+# Train/test split
+# -------------------------
+X = df["text_clean"].values
+y = df["sentiment"].values
+
+# stratify to keep class distribution
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+
+print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+# -------------------------
+# TF-IDF + Models pipelines
+# -------------------------
+tfidf = TfidfVectorizer(ngram_range=(1,2), max_df=0.9, min_df=3, max_features=20000)
+
+# 1) Logistic Regression pipeline
+pipe_lr = Pipeline([("tfidf", tfidf), ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE))])
+param_grid_lr = {
+    "clf__C": [0.1, 1.0, 3.0],
+    "clf__penalty": ["l2"],
+    "clf__solver": ["lbfgs", "saga"],
+}
+
+# 2) Random Forest pipeline
+pipe_rf = Pipeline([("tfidf", tfidf), ("clf", RandomForestClassifier(random_state=RANDOM_STATE))])
+param_grid_rf = {
+    "clf__n_estimators": [100, 200],
+    "clf__max_depth": [None, 20],
+    "clf__min_samples_split": [2, 5],
+}
+
+# 3) SVM pipeline (linear kernel)
+pipe_svm = Pipeline([("tfidf", tfidf), ("clf", SVC(kernel="linear", probability=True, random_state=RANDOM_STATE))])
+param_grid_svm = {
+    "clf__C": [0.1, 1.0, 3.0],
+}
+
+# Choose quick CV
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+
+# Function to run GridSearch for a pipeline and return best estimator
+def tune_and_evaluate(pipe, param_grid, name="model"):
+    print(f"\nTuning {name} ...")
+    gs = GridSearchCV(pipe, param_grid, cv=cv, n_jobs=-1, scoring="f1_macro", verbose=1)
+    gs.fit(X_train, y_train)
+    print(f"Best params for {name}:", gs.best_params_)
+    best = gs.best_estimator_
+
+    # evaluate on test
+    print(f"Evaluating {name} on test set...")
+    y_pred = best.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="macro")
+    print(f"Test Accuracy: {acc:.4f}  |  Macro F1: {f1:.4f}")
+    print("Classification report:\n", classification_report(y_test, y_pred))
+    cm = confusion_matrix(y_test, y_pred, labels=["positive", "neutral", "negative"])
+    plt.figure(figsize=(6,4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["pos","neu","neg"], yticklabels=["pos","neu","neg"])
+    plt.title(f"Confusion Matrix - {name}")
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+    plt.show()
+
+    return best
+
+# -------------------------
+# Run tuning (can be heavy) - you can comment out some to run faster
+# -------------------------
+best_lr = tune_and_evaluate(pipe_lr, param_grid_lr, name="LogisticRegression")
+best_rf = tune_and_evaluate(pipe_rf, param_grid_rf, name="RandomForest")
+best_svm = tune_and_evaluate(pipe_svm, param_grid_svm, name="SVM")
+
+# Choose best model by macro F1 on test set
+models = {"lr": best_lr, "rf": best_rf, "svm": best_svm}
+scores = {}
+for k, m in models.items():
+    y_pred = m.predict(X_test)
+    scores[k] = f1_score(y_test, y_pred, average="macro")
+print("Macro F1 scores:", scores)
+best_key = max(scores, key=scores.get)
+final_model = models[best_key]
+print("Selected best model:", best_key)
+
+# Save final model
+joblib.dump(final_model, MODEL_DIR / f"best_model_{best_key}.joblib")
+print("Saved model to", MODEL_DIR / f"best_model_{best_key}.joblib")
+
+# -------------------------
+# Example: predict new reviews
+# -------------------------
+samples = [
+    "This medicine reduced my pain fast and had no side effects.",
+    "I felt awful after taking the drug, it made me sick.",
+    "It was okay, not great but not bad either.",
+]
+preds = final_model.predict(samples)
+probs = final_model.predict_proba(samples) if hasattr(final_model, "predict_proba") else None
+for s, p in zip(samples, preds):
+    print(f"REVIEW: {s}\nPREDICTED: {p}\n")
+    if probs is not None:
+        print("Probs:", np.round(probs[np.where(samples==s)[0][0]], 3))
